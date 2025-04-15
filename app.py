@@ -1,44 +1,68 @@
 from flask import Flask, jsonify
-import psycopg2
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests
+CORS(app)
 
-DB_CONFIG = {
-    "host": "localhost",
-    "database": "youtube_stats",
-    "user": "postgres",
-    "password": "aryan",
-    "port": "5432"  # Default PostgreSQL port
-}
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:aryan@localhost:5432/youtube_stats'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+class YT(db.Model):
+    __tablename__ = 'yt'
+    
+    ID = db.Column('ID', db.Text, primary_key=True)
+    title = db.Column('title', db.Text)
+    category = db.Column('category', db.Text)
+    views = db.Column('#views', db.Integer)
+    comments = db.Column('#comments', db.Integer)
+    likes = db.Column('#likes', db.Integer)
+    dislikes = db.Column('#dislikes', db.Integer)
+    timestamp = db.Column('timestamp', db.Text)
+    duration = db.Column('duration', db.Float)
+    description = db.Column('description', db.Text)
+    tags = db.Column('tags', db.Text)
+    country = db.Column('country', db.Text)
+    combined_text = db.Column('combined_text', db.Text)
+
+def parse_timestamp(timestamp_str):
+    """Convert string timestamp to ISO format"""
+    try:
+        for fmt in ('%Y-%m-%d','%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                dt = datetime.strptime(timestamp_str, fmt)
+                return dt.isoformat()
+            except ValueError:
+                continue
+        return timestamp_str  # Return raw string if parsing fails
+    except Exception:
+        return None
 
 @app.route('/test', methods=['GET'])
-def get_data():
+def test():
     try:
-        # Connect to PostgreSQL
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        
-        # Execute query
-        cursor.execute("SELECT * FROM yt LIMIT 10")
-        
-        # Get column names
-        columns = [desc[0] for desc in cursor.description]
-        
-        # Format results
-        results = []
-        for row in cursor.fetchall():
-            results.append(dict(zip(columns, row)))
-            
-        # Close connection
-        cursor.close()
-        conn.close()
-        
-        return jsonify(results)
-        
+        results = YT.query.limit(10).all()
+        return jsonify([{
+            "ID": item.ID,
+            "title": item.title,
+            "category": item.category,
+            "views": item.views,
+            "comments": item.comments,
+            "likes": item.likes,
+            "dislikes": item.dislikes,
+            "timestamp": parse_timestamp(item.timestamp),
+            "duration": item.duration,
+            "description": item.description,
+            "tags": item.tags,
+            "country": item.country,
+            "combined_text": item.combined_text
+        } for item in results])
+    
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        app.logger.error(f"Database error: {str(e)}")
+        return jsonify({"error": "Database operation failed"}), 500
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
