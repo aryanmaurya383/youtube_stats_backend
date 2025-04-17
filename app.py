@@ -64,5 +64,34 @@ def test():
         app.logger.error(f"Database error: {str(e)}")
         return jsonify({"error": "Database operation failed"}), 500
 
+@app.route('/word_cloud', methods=['GET'])
+def word_cloud():
+    try:
+        results = YT.query.with_entities(
+            YT.country,
+            YT.category,
+            YT.tags
+        ).limit(100).all()
+
+        formatted_data = [
+            {
+                "country": item.country or "Unknown",
+                "category": item.category or "Uncategorized",
+                "tags": "|".join(
+                    [tag.strip('"') for tag in item.tags.split('|')]
+                ) if item.tags else ""
+            }
+            for item in results
+        ]
+
+        return jsonify(formatted_data)
+
+    except Exception as e:
+        app.logger.error(f"Word cloud error: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate word cloud data",
+            "details": str(e)
+        }), 500
+
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
