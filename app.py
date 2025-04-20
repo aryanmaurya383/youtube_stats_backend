@@ -2,8 +2,13 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime
-from sqlalchemy import func
+from sqlalchemy import func, text
 import json
+import calendar
+from datetime import date
+from collections import defaultdict
+import time
+
 app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
@@ -18,6 +23,24 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:aryan@localhost:5
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+def add_dates_filter_to_query(query, start_mon, end_mon):
+    if start_mon and end_mon:
+        # Parse YYY-MM input to date objects
+        start_year, start_month = map(int, start_mon.split('-'))
+        end_year, end_month = map(int, end_mon.split('-'))
+        
+        # Create first day of start month
+        start_date = date(start_year, start_month, 1)
+        
+        # Create last day of end month
+        last_day = calendar.monthrange(end_year, end_month)[1]
+        end_date = date(end_year, end_month, last_day)
+        
+        return query.filter(YT.timestamp.between(start_date, end_date))
+    return query
+
+
+
 class YT(db.Model):
     __tablename__ = 'yt'
     
@@ -28,7 +51,7 @@ class YT(db.Model):
     comments = db.Column('#comments', db.Integer)
     likes = db.Column('#likes', db.Integer)
     dislikes = db.Column('#dislikes', db.Integer)
-    timestamp = db.Column('timestamp', db.Text)
+    timestamp = db.Column('timestamp', db.Date)  
     duration = db.Column('duration', db.Float)
     description = db.Column('description', db.Text)
     tags = db.Column('tags', db.Text)
@@ -59,7 +82,7 @@ def test():
             "comments": item.comments,
             "likes": item.likes,
             "dislikes": item.dislikes,
-            "timestamp": parse_timestamp(item.timestamp),
+            "timestamp": item.timestamp.isoformat() if item.timestamp else None,
             "duration": item.duration,
             "description": item.description,
             "tags": item.tags,
@@ -70,33 +93,68 @@ def test():
         app.logger.error(f"Database error: {str(e)}")
         return jsonify({"error": "Database operation failed"}), 500
 
+MAX_WORDS = 150
+MIN_OCCURRENCE = 3
 @app.route('/word_cloud', methods=['GET'])
 def word_cloud():
     try:
-        results = YT.query.with_entities(
-            YT.country,
-            YT.category,
-            YT.tags
-        ).filter(YT.country == "CA").limit(1000).all()
+        # Get query parameters
+        country = request.args.get('country')
+        category = request.args.get('category')
+        start_date = request.args.get('startDate')
+        end_date = request.args.get('endDate')
 
-        results += YT.query.with_entities(
-            YT.country,
-            YT.category,
-            YT.tags
-        ).filter(YT.country == "US").limit(1000).all()
+        # Build the SQL query with proper tag cleaning and filtering
+        sql = """
+        SELECT lower(trim(both '"' from tag)) as cleaned_tag, COUNT(*) as count
+        FROM (
+            SELECT unnest(string_to_array(tags, '|')) as tag
+            FROM yt
+            WHERE tags IS NOT NULL AND tags != ''
+        """
+        params = {
+            'min_occurrence': MIN_OCCURRENCE,
+            'max_words': MAX_WORDS
+        }
 
-        formatted_data = [
-            {
-                "country": item.country or "Unknown",
-                "category": item.category or "Uncategorized",
-                "tags": "|".join(
-                    [tag.strip('"') for tag in item.tags.split('|')]
-                ) if item.tags else ""
-            }
-            for item in results
-        ]
+        # Apply filters
+        if country:
+            sql += " AND country = :country"
+            params['country'] = country
+        if category:
+            sql += " AND category = :category"
+            params['category'] = category
+        
+        if start_date and end_date:
+            # Convert to date objects
+            start_year, start_month = map(int, start_date.split('-'))
+            end_year, end_month = map(int, end_date.split('-'))
+            
+            start_full = date(start_year, start_month, 1)
+            last_day = calendar.monthrange(end_year, end_month)[1]
+            end_full = date(end_year, end_month, last_day)
+            
+            sql += " AND timestamp BETWEEN :start_date AND :end_date"
+            params['start_date'] = start_full
+            params['end_date'] = end_full
 
-        return jsonify(formatted_data)
+        sql += """
+        ) sub
+        WHERE tag != ''  -- Exclude empty tags
+        GROUP BY lower(trim(both '"' from tag))
+        HAVING COUNT(*) >= :min_occurrence
+        ORDER BY count DESC
+        LIMIT :max_words
+        """
+
+        # Execute query
+        results = db.session.execute(text(sql), params).fetchall()
+
+        # Format response
+        word_data = [{"text": row.cleaned_tag, "value": int(row.count)} 
+                     for row in results if row.cleaned_tag]
+
+        return jsonify(word_data)
 
     except Exception as e:
         app.logger.error(f"Word cloud error: {str(e)}")
@@ -105,8 +163,6 @@ def word_cloud():
             "details": str(e)
         }), 500
 
-
-
 @app.route('/bar_chart', methods=['GET'])
 def bar_chart():
     try:
@@ -114,6 +170,7 @@ def bar_chart():
         country = request.args.get('country')
         start_date = request.args.get('startDate')
         end_date = request.args.get('endDate')
+
 
         # Base query
         query = YT.query.with_entities(
@@ -127,8 +184,7 @@ def bar_chart():
         if country and country != "ALL":
             query = query.filter(YT.country == country)
         
-        if start_date and end_date:
-            query = query.filter(YT.timestamp.between(start_date, end_date))
+        query=add_dates_filter_to_query(query, start_date, end_date)
 
         # Group by category and filter only the 7 main categories
         results = query.group_by(YT.category).all()
@@ -172,9 +228,7 @@ def radar_chart():
             func.avg(YT.duration).label('avg_duration')
         )
 
-        if start_date and end_date:
-            query = query.filter(YT.timestamp.between(start_date, end_date))
-       
+        query=add_dates_filter_to_query(query, start_date, end_date)     
 
         # Apply category filter
         if categories:
@@ -202,6 +256,68 @@ def radar_chart():
             "details": str(e)
         }), 500
 
+@app.route('/world_map', methods=['GET'])
+def world_map():
+    try:
+        # Get parameters from request
+        start_date = request.args.get('startDate')
+        end_date = request.args.get('endDate')
+        metric = request.args.get('metric', 'likes').lower()
+
+        # Map metric to database column
+        metric_columns = {
+            'likes': YT.likes,
+            'dislikes': YT.dislikes,
+            'views': YT.views,
+            'comments': YT.comments
+        }
+
+        if metric not in metric_columns:
+            return jsonify({"error": "Invalid metric"}), 400
+
+        metric_col = metric_columns[metric]
+
+        # Base query with filters
+        query = db.session.query(
+            YT.country,
+            YT.category,
+            func.sum(metric_col).label('total')
+        )
+
+        query=add_dates_filter_to_query(query, start_date, end_date)
+
+        # Execute query and group results
+        results = query.group_by(YT.country, YT.category).all()
+
+        # Process results into country-based format
+        country_map = {}
+        categories = [
+            'Current Affairs', 'Films', 'Gaming and Sports',
+            'Music', 'People and Lifestyle', 
+            'Science and Technology', 'Travel and Vlogs'
+        ]
+
+        for country, category, total in results:
+            if country not in country_map:
+                # Initialize with all categories at 0
+                country_map[country] = {'country': country}
+                for cat in categories:
+                    country_map[country][cat] = 0.0
+            
+            if category in categories:
+                country_map[country][category] = float(total) if total else 0.0
+
+        # Convert to list and fill missing countries
+        formatted_data = list(country_map.values())
+
+        return jsonify(formatted_data)
+
+    except Exception as e:
+        app.logger.error(f"World map error: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate world map data",
+            "details": str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=8000, debug=True)
