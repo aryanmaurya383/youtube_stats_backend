@@ -8,6 +8,7 @@ import calendar
 from datetime import date
 from collections import defaultdict
 import time
+import re
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -23,18 +24,20 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:aryan@localhost:5
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+
+def convert_to_full_dates(start_date, end_date):
+    start_year, start_month = map(int, start_date.split('-'))
+    end_year, end_month = map(int, end_date.split('-'))
+    
+    start_full = date(start_year, start_month, 1)
+    last_day = calendar.monthrange(end_year, end_month)[1]
+    end_full = date(end_year, end_month, last_day)
+    return start_full, end_full
+
 def add_dates_filter_to_query(query, start_mon, end_mon):
     if start_mon and end_mon:
         # Parse YYY-MM input to date objects
-        start_year, start_month = map(int, start_mon.split('-'))
-        end_year, end_month = map(int, end_mon.split('-'))
-        
-        # Create first day of start month
-        start_date = date(start_year, start_month, 1)
-        
-        # Create last day of end month
-        last_day = calendar.monthrange(end_year, end_month)[1]
-        end_date = date(end_year, end_month, last_day)
+        start_date,end_date=convert_to_full_dates(start_mon, end_mon)
         
         return query.filter(YT.timestamp.between(start_date, end_date))
     return query
@@ -69,6 +72,7 @@ def parse_timestamp(timestamp_str):
         return timestamp_str  # Return raw string if parsing fails
     except Exception:
         return None
+
 
 @app.route('/test', methods=['GET'])
 def test():
@@ -127,12 +131,7 @@ def word_cloud():
         
         if start_date and end_date:
             # Convert to date objects
-            start_year, start_month = map(int, start_date.split('-'))
-            end_year, end_month = map(int, end_date.split('-'))
-            
-            start_full = date(start_year, start_month, 1)
-            last_day = calendar.monthrange(end_year, end_month)[1]
-            end_full = date(end_year, end_month, last_day)
+            start_full, end_full = convert_to_full_dates(start_date, end_date)
             
             sql += " AND timestamp BETWEEN :start_date AND :end_date"
             params['start_date'] = start_full
@@ -192,8 +191,8 @@ def bar_chart():
         # Format response
         formatted_data = [{
             "category": row.category or "Uncategorized",
-            "likes": int(row.total_likes) or 0,
-            "views": int(row.total_views) or 0,
+            "likes": int(row.total_likes/1000000) or 0,
+            "views": int(row.total_views/1000000) or 0,
             "videos": int(row.video_count) or 0
         } for row in results]
 
@@ -316,6 +315,268 @@ def world_map():
         app.logger.error(f"World map error: {str(e)}")
         return jsonify({
             "error": "Failed to generate world map data",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/corr_mat', methods=['GET'])
+def corr_mat():
+    try:
+        start_mon = request.args.get('startDate')
+        end_mon = request.args.get('endDate')
+        country = request.args.get('country', 'US')
+
+        start_date=None
+        end_date=None
+        if start_mon and end_mon:
+            start_date,end_date=convert_to_full_dates(start_mon, end_mon)
+
+        sql = '''
+        SELECT 
+            COALESCE(category, 'ALL') as category,
+            COALESCE(CORR("#likes", "#views"), 0) as likes_views,
+            COALESCE(CORR("#likes", "#dislikes"), 0) as likes_dislikes,
+            COALESCE(CORR("#likes", "#comments"), 0) as likes_comments,
+            COALESCE(CORR("#likes", "duration"), 0) as likes_duration,
+            COALESCE(CORR("#views", "#dislikes"), 0) as views_dislikes,
+            COALESCE(CORR("#views", "#comments"), 0) as views_comments,
+            COALESCE(CORR("#views", "duration"), 0) as views_duration,
+            COALESCE(CORR("#dislikes", "#comments"), 0) as dislikes_comments,
+            COALESCE(CORR("#dislikes", "duration"), 0) as dislikes_duration,
+            COALESCE(CORR("#comments", "duration"), 0) as comments_duration
+        FROM yt
+        WHERE (:start_date IS NULL OR timestamp >= :start_date) AND
+            (:end_date IS NULL OR timestamp <= :end_date)  AND
+            (country = :country OR :country = 'ALL')
+        GROUP BY GROUPING SETS ((category), ())
+        '''
+
+        results = db.session.execute(text(sql), {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country
+        }).fetchall()
+
+        formatted_data = [
+            {
+                "category": row.category,
+                "likes_views": float(row.likes_views),
+                "likes_dislikes": float(row.likes_dislikes),
+                "likes_comments": float(row.likes_comments),
+                "likes_duration": float(row.likes_duration),
+                "views_dislikes": float(row.views_dislikes),
+                "views_comments": float(row.views_comments),
+                "views_duration": float(row.views_duration),
+                "dislikes_comments": float(row.dislikes_comments),
+                "dislikes_duration": float(row.dislikes_duration),
+                "comments_duration": float(row.comments_duration)
+            }
+            for row in results
+        ]
+
+        return jsonify(formatted_data)
+    except Exception as e:
+        app.logger.error(f"Correlation matrix error: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate correlation matrix",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/month_cat', methods=['GET'])
+def monthly_category_metrics():
+    try:
+        # Get parameters
+        start_mon = request.args.get('startDate')
+        end_mon = request.args.get('endDate')
+        metric = request.args.get('metric', 'likes').lower()
+        
+        # Validate metric
+        valid_metrics = {'likes', 'views', 'comments', 'dislikes'}
+        if metric not in valid_metrics:
+            return jsonify({"error": "Invalid metric"}), 400
+
+        # Convert to full dates
+        start_date, end_date = convert_to_full_dates(start_mon, end_mon)
+        
+        # Build query
+        sql = text("""
+        SELECT 
+            category,
+            DATE_TRUNC('month', timestamp) AS month,
+            SUM("#{metric}") AS total
+        FROM yt
+        WHERE timestamp BETWEEN :start_date AND :end_date
+        GROUP BY category, DATE_TRUNC('month', timestamp)
+        ORDER BY DATE_TRUNC('month', timestamp), category
+        """.format(metric=metric))
+
+        # Execute query
+        results = db.session.execute(sql, {
+            'start_date': start_date,
+            'end_date': end_date
+        }).fetchall()
+
+        # Create date range
+        dates = []
+        current = start_date.replace(day=1)
+        end = end_date.replace(day=1)
+        while current <= end:
+            dates.append(current.strftime("%Y-%m"))
+            if current.month == 12:
+                current = current.replace(year=current.year+1, month=1)
+            else:
+                current = current.replace(month=current.month+1)
+        
+        # Format response
+        response = {}
+        for row in results:
+            category = row.category
+            month_str = row.month.strftime("%Y-%m")
+            
+            if category not in response:
+                response[category] = {
+                    'category': category,
+                    'data': {date: 0 for date in dates}
+                }
+            
+            response[category]['data'][month_str] = int(row.total) if row.total else 0
+
+        # Convert to list and fill missing months
+        formatted_data = []
+        for cat in response.values():
+            formatted_data.append({
+                'category': cat['category'],
+                'months': [{'month': date, 'total': cat['data'][date]} for date in dates]
+            })
+
+        return jsonify(formatted_data)
+
+    except Exception as e:
+        app.logger.error(f"Monthly category metrics error: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate monthly category metrics",
+            "details": str(e)
+        }), 500
+
+@app.route('/month_specific', methods=['GET'])
+def month_specific():
+    try:
+        # Get parameters
+        year_month = request.args.get('month')
+        
+        # Validate input format
+        if not re.match(r'^\d{4}-\d{2}$', year_month):
+            return jsonify({"error": "Invalid month format. Use YYYY-MM"}), 400
+            
+        year, month = map(int, year_month.split('-'))
+        
+        # Validate month range
+        if month < 1 or month > 12:
+            return jsonify({"error": "Invalid month. Must be 01-12"}), 400
+
+        # Calculate month start/end dates
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+
+        # Query database
+        sql = text("""
+        SELECT 
+            COALESCE(SUM("#views"), 0) AS total_views,
+            COALESCE(SUM("#likes"), 0) AS total_likes,
+            COALESCE(SUM("#comments"), 0) AS total_comments
+        FROM yt
+        WHERE timestamp BETWEEN :start_date AND :end_date
+        """)
+
+        result = db.session.execute(sql, {
+            'start_date': first_day,
+            'end_date': last_day
+        }).fetchone()
+
+        # Format response
+        response = {
+            "month": year_month,
+            "totals": {
+                "views": int(result.total_views),
+                "likes": int(result.total_likes),
+                "comments": int(result.total_comments)
+            }
+        }
+
+        return jsonify(response)
+
+    except ValueError as ve:
+        return jsonify({"error": f"Invalid date parameters: {str(ve)}"}), 400
+    except Exception as e:
+        app.logger.error(f"Month specific error: {str(e)}")
+        return jsonify({
+            "error": "Failed to retrieve monthly totals",
+            "details": str(e)
+        }), 500
+
+@app.route('/temp', methods=['GET'])
+def temp():
+    try:
+        # Get parameters
+        start_mon = request.args.get('startDate')
+        end_mon = request.args.get('endDate')
+        metric = request.args.get('metric', 'likes').lower()
+        
+        # Validate metric
+        valid_metrics = {'likes', 'views', 'comments', 'dislikes'}
+        if metric not in valid_metrics:
+            return jsonify({"error": "Invalid metric"}), 400
+
+        # Convert to full dates
+        start_date, end_date = convert_to_full_dates(start_mon, end_mon)
+        
+        # Build query
+        sql = text("""
+        SELECT 
+            DATE_TRUNC('month', timestamp) AS month,
+            SUM("#{metric}") AS total
+        FROM yt
+        WHERE timestamp BETWEEN :start_date AND :end_date
+        GROUP BY DATE_TRUNC('month', timestamp)
+        ORDER BY DATE_TRUNC('month', timestamp)
+        """.format(metric=metric))
+
+        # Execute query
+        results = db.session.execute(sql, {
+            'start_date': start_date,
+            'end_date': end_date
+        }).fetchall()
+
+        # Create date range
+        dates = []
+        current = start_date.replace(day=1)
+        end = end_date.replace(day=1)
+        while current <= end:
+            dates.append(current.strftime("%Y-%m"))
+            if current.month == 12:
+                current = current.replace(year=current.year+1, month=1)
+            else:
+                current = current.replace(month=current.month+1)
+        
+        # Initialize response with all months
+        monthly_data = {date: 0 for date in dates}
+        
+        # Fill with actual data
+        for row in results:
+            month_str = row.month.strftime("%Y-%m")
+            monthly_data[month_str] = int(row.total) if row.total else 0
+
+        # Format response
+        formatted_data = [{'month': date, 'total': monthly_data[date]} 
+                         for date in dates]
+
+        return jsonify(formatted_data)
+
+    except Exception as e:
+        app.logger.error(f"Monthly totals error: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate monthly totals",
             "details": str(e)
         }), 500
 
