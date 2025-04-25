@@ -114,7 +114,7 @@ def word_cloud():
         FROM (
             SELECT unnest(string_to_array(tags, '|')) as tag
             FROM yt
-            WHERE tags IS NOT NULL AND tags != ''
+            WHERE tags IS NOT NULL AND tags != '' AND tags != '[none]'
         """
         params = {
             'min_occurrence': MIN_OCCURRENCE,
@@ -176,6 +176,8 @@ def bar_chart():
             YT.category,
             func.sum(YT.likes).label('total_likes'),
             func.sum(YT.views).label('total_views'),
+            func.sum(YT.comments).label('total_comments'),
+            func.sum(YT.dislikes).label('total_dislikes'),
             func.count(YT.ID).label('video_count')
         )
         print(country)
@@ -193,7 +195,9 @@ def bar_chart():
             "category": row.category or "Uncategorized",
             "likes": int(row.total_likes/1000000) or 0,
             "views": int(row.total_views/1000000) or 0,
-            "videos": int(row.video_count) or 0
+            "videos": int(row.video_count) or 0,
+            "comments": int(row.total_comments/1000000) or 0,
+            "dislikes": int(row.total_dislikes/1000000) or 0
         } for row in results]
 
         return jsonify(formatted_data)
@@ -390,6 +394,7 @@ def monthly_category_metrics():
         start_mon = request.args.get('startDate')
         end_mon = request.args.get('endDate')
         metric = request.args.get('metric', 'likes').lower()
+        country = request.args.get('country', 'ALL').upper()  # New parameter
         
         # Validate metric
         valid_metrics = {'likes', 'views', 'comments', 'dislikes'}
@@ -400,24 +405,39 @@ def monthly_category_metrics():
         start_date, end_date = convert_to_full_dates(start_mon, end_mon)
         
         # Build query
-        sql = text("""
+        base_sql = """
         SELECT 
             category,
             DATE_TRUNC('month', timestamp) AS month,
-            SUM("#{metric}") AS total
+            SUM("#{metric}") AS total,
+            COUNT(*) AS video_count
         FROM yt
         WHERE timestamp BETWEEN :start_date AND :end_date
+        """
+
+        # Add country condition
+        if country != 'ALL':
+            base_sql += " AND country = :country "
+
+        base_sql += """
         GROUP BY category, DATE_TRUNC('month', timestamp)
         ORDER BY DATE_TRUNC('month', timestamp), category
-        """.format(metric=metric))
+        """
 
-        # Execute query
-        results = db.session.execute(sql, {
+        sql = text(base_sql.format(metric=metric))
+
+        # Prepare parameters
+        params = {
             'start_date': start_date,
             'end_date': end_date
-        }).fetchall()
+        }
+        if country != 'ALL':
+            params['country'] = country
 
-        # Create date range
+        # Execute query
+        results = db.session.execute(sql, params).fetchall()
+
+        # Create date range (original code unchanged)
         dates = []
         current = start_date.replace(day=1)
         end = end_date.replace(day=1)
@@ -428,7 +448,7 @@ def monthly_category_metrics():
             else:
                 current = current.replace(month=current.month+1)
         
-        # Format response
+        # Format response (original code unchanged)
         response = {}
         for row in results:
             category = row.category
@@ -440,7 +460,7 @@ def monthly_category_metrics():
                     'data': {date: 0 for date in dates}
                 }
             
-            response[category]['data'][month_str] = int(row.total) if row.total else 0
+            response[category]['data'][month_str] =  round(row.total / row.video_count, 2) if row.video_count > 0 else 0
 
         # Convert to list and fill missing months
         formatted_data = []
@@ -518,29 +538,23 @@ def month_specific():
 @app.route('/temp', methods=['GET'])
 def temp():
     try:
-        # Get parameters
-        start_mon = request.args.get('startDate')
-        end_mon = request.args.get('endDate')
-        metric = request.args.get('metric', 'likes').lower()
+        # Get parameters (removed metric)
+        start_mon = request.args.get('startDate', "2017-01")
+        end_mon = request.args.get('endDate', "2021-12")
         
-        # Validate metric
-        valid_metrics = {'likes', 'views', 'comments', 'dislikes'}
-        if metric not in valid_metrics:
-            return jsonify({"error": "Invalid metric"}), 400
-
         # Convert to full dates
         start_date, end_date = convert_to_full_dates(start_mon, end_mon)
         
-        # Build query
+        # Modified SQL query (COUNT instead of SUM)
         sql = text("""
         SELECT 
             DATE_TRUNC('month', timestamp) AS month,
-            SUM("#{metric}") AS total
+            COUNT(*) AS total
         FROM yt
         WHERE timestamp BETWEEN :start_date AND :end_date
         GROUP BY DATE_TRUNC('month', timestamp)
         ORDER BY DATE_TRUNC('month', timestamp)
-        """.format(metric=metric))
+        """)
 
         # Execute query
         results = db.session.execute(sql, {
@@ -548,7 +562,7 @@ def temp():
             'end_date': end_date
         }).fetchall()
 
-        # Create date range
+        # Create date range (unchanged)
         dates = []
         current = start_date.replace(day=1)
         end = end_date.replace(day=1)
@@ -565,7 +579,7 @@ def temp():
         # Fill with actual data
         for row in results:
             month_str = row.month.strftime("%Y-%m")
-            monthly_data[month_str] = int(row.total) if row.total else 0
+            monthly_data[month_str] = int(row.total)  # COUNT(*) always returns an integer
 
         # Format response
         formatted_data = [{'month': date, 'total': monthly_data[date]} 
@@ -574,9 +588,9 @@ def temp():
         return jsonify(formatted_data)
 
     except Exception as e:
-        app.logger.error(f"Monthly totals error: {str(e)}")
+        app.logger.error(f"Monthly counts error: {str(e)}")
         return jsonify({
-            "error": "Failed to generate monthly totals",
+            "error": "Failed to generate monthly counts",
             "details": str(e)
         }), 500
 
