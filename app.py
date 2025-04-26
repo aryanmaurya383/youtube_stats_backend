@@ -9,6 +9,7 @@ from datetime import date
 from collections import defaultdict
 import time
 import re
+from Project.prediction import predict_from_input as predict_stats_from_input
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -533,6 +534,52 @@ def month_specific():
         return jsonify({
             "error": "Failed to retrieve monthly totals",
             "details": str(e)
+        }), 500
+
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        # Get JSON data from request
+        input_data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['tags', 'duration', 'country', 'category']
+        if not all(field in input_data for field in required_fields):
+            return jsonify({"error": "Missing required field(s)"}), 400
+
+        # Convert duration to numeric
+        try:
+            input_data['duration'] = float(input_data['duration'])
+        except ValueError:
+            return jsonify({"error": "Invalid duration format"}), 400
+
+        # Make prediction
+        predictions = predict_stats_from_input(input_data)
+        
+        # Handle invalid category case
+        if not predictions:
+            return jsonify({"error": "Invalid category specified"}), 400
+
+        # Format response with rounded numbers
+        formatted_response = {
+            "predictions": {
+                "#views": round(predictions.get('#views', 0)),
+                "#likes": round(predictions.get('#likes', 0)),
+                "#comments": round(predictions.get('#comments', 0)),
+                "#dislikes": round(predictions.get('#dislikes', 0))
+            },
+            "status": "success"
+        }
+
+        return jsonify(formatted_response)
+
+    except Exception as e:
+        app.logger.error(f"Prediction error: {str(e)}")
+        return jsonify({
+            "error": "Prediction failed",
+            "details": str(e),
+            "status": "error"
         }), 500
 
 @app.route('/temp', methods=['GET'])

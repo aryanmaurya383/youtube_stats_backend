@@ -10,3 +10,5 @@ htmlcov/
 docs/_build/
 .env
 dataset/
+*.pkl
+*word2vec.txt
