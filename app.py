@@ -21,7 +21,9 @@ CORS(app, resources={
     }
 })
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:aryan@localhost:5432/youtube_stats'
+USERNAME="postgres"
+PASSWORD="aryan"
+app.config['SQLALCHEMY_DATABASE_URI'] = f'postgresql://{USERNAME}:{PASSWORD}@localhost:5432/youtube_stats'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -42,7 +44,6 @@ def add_dates_filter_to_query(query, start_mon, end_mon):
         
         return query.filter(YT.timestamp.between(start_date, end_date))
     return query
-
 
 
 class YT(db.Model):
